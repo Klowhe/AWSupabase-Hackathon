@@ -1,5 +1,2 @@
-node_modules
-bun.lockb
 venv
-
-.env
+.env.local

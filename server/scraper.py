@@ -1,59 +1,43 @@
 import os
 import requests
 from bs4 import BeautifulSoup
-import re
+from data import urls
 
 
-def clean_text(text):
-    # Remove HTML tags
-    clean = re.sub("<[^<]+?>", "", text)
-    # Remove extra whitespace
-    clean = re.sub("\s+", " ", clean).strip()
-    return clean
+# List of URLs to scrape
+def clean_html(html):
+    """Remove HTML tags and extra whitespace."""
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text()
+    return " ".join(text.split())
 
 
-def download_content(url, base_folder):
-    response = requests.get(url)
-    if response.status_code != 200:
-        print(f"Failed to fetch {url}")
-        return
-
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    # Create a filename from the URL
-    filename = url.split("/")[-1]
-    if not filename.endswith(".txt"):
-        filename += ".txt"
-
-    # Create the full path
-    file_path = os.path.join(base_folder, filename)
-
-    # Clean and save the content
-    clean_content = clean_text(soup.get_text())
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(clean_content)
-
-    print(f"Saved {url} to {file_path}")
-
-    # Find all links and recursively download their content
-    for link in soup.find_all("a", href=True):
-        href = link["href"]
-        if href.startswith("http"):
-            download_content(href, base_folder)
-        elif href.startswith("/"):
-            # Handle relative URLs
-            base_url = "/".join(url.split("/")[:3])
-            download_content(base_url + href, base_folder)
+def save_to_file(content, filename):
+    """Save cleaned content to a file."""
+    with open(filename, "w", encoding="utf-8") as file:
+        file.write(content)
 
 
-def main():
-    base_url = "https://singaporelegaladvice.com/law-articles/buying-selling-property/"
-    base_folder = "downloaded_content"
+# Create a folder to save the files
+if not os.path.exists("scraped_content"):
+    os.makedirs("scraped_content")
 
-    os.makedirs(base_folder, exist_ok=True)
+# Scrape each URL and save the cleaned content
+# Headers to mimic a request from a web browser
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
 
-    download_content(base_url, base_folder)
+# Scrape each URL and save the cleaned content
+for url in urls:
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        cleaned_content = clean_html(response.text)
+        file_name = os.path.join("scraped_content", url.split("/")[-2] + ".txt")
+        save_to_file(cleaned_content, file_name)
+        print(f"Saved cleaned content from {url} to {file_name}")
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to scrape {url}: {e}")
 
-
-if __name__ == "__main__":
-    main()
+print("Scraping completed.")
