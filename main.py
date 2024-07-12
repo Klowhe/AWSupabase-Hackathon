@@ -19,7 +19,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Helpers
 def detect_text(image_bytes):
-    print("===> Detecting text from image with AWS Rekognition")
+    print("==> Detecting text from image with AWS Rekognition")
     response = rekognition_client.detect_text(Image={'Bytes': image_bytes})
     detected_text = []
     for text_detection in response['TextDetections']:
@@ -29,14 +29,14 @@ def detect_text(image_bytes):
 # Responses
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text: str = update.message.text
-    print(f"===> User: {text}")
+    print(f"==> User: {text}")
 
     response: str = "Thank you for telling me more about your situation."
     print(f"==> Bot: {response}")
     await update.message.reply_text(response)
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print(f"===> User uploaded an image")
+    print(f"==> User uploaded an image")
     file = await context.bot.getFile(update.message.photo[-1].file_id)
     image_bytes = await file.download_as_bytearray()
     
@@ -67,6 +67,6 @@ if __name__ == "__main__":
     app.add_error_handler(error)
 
     # Polls the bot
-    print("===> Polling")
+    print("==> Polling")
     app.run_polling(poll_interval=3)
 
