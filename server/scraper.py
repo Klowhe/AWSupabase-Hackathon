@@ -5,9 +5,8 @@ import re
 
 
 def clean_text(text):
-    # Remove HTML tags
+
     clean = re.sub("<[^<]+?>", "", text)
-    # Remove extra whitespace
     clean = re.sub("\s+", " ", clean).strip()
     return clean
 
