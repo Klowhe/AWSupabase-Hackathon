@@ -24,6 +24,7 @@ bedrock_client = boto3.client(
     service_name="bedrock-runtime",
     region_name="us-west-2"
 )
+
 modelID = "anthropic.claude-v2:1"
 
 # Initialize Bedrock LLM
@@ -101,7 +102,6 @@ async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == "__main__":
     print("=== igotscammed has been started ===")
-    print(f"Bot Token: {bot_token}")  # Add this line to check the token
     app = Application.builder().token(bot_token).build()
 
     # Commands
@@ -118,4 +118,3 @@ if __name__ == "__main__":
     # Polls the bot
     print("==> Polling")
     app.run_polling(poll_interval=3)
-
