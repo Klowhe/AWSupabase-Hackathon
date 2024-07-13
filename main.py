@@ -1,18 +1,48 @@
 import os
-import time
 import boto3
-import json
 from typing import Final
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from langchain.chains import LLMChain
+from langchain.llms.bedrock import Bedrock
+from langchain.prompts import PromptTemplate
 
 load_dotenv()
 bot_token = os.getenv('TELEGRAM_URL')
 
-s3_client = boto3.client('s3')
+# Create a boto3 session with the new credentials
+session = boto3.Session(
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
+    region_name=os.getenv("AWS_DEFAULT_REGION")
+)
+
+#bedrock client
+bedrock_client = boto3.client(
+    service_name="bedrock-runtime",
+    region_name="us-west-2"
+)
+modelID = "anthropic.claude-v2:1"
+
+# Initialize Bedrock LLM
+llm = Bedrock(
+    model_id=modelID,
+    client=bedrock_client,
+    model_kwargs={"max_tokens_to_sample": 2000, "temperature": 0.9}
+)
+
+# Define the prompt template
+prompt = PromptTemplate(
+    input_variables=["language", "freeform_text"],
+    template="You are a chatbot. You are in {language}.\n\n{freeform_text}"
+)
+
+# Initialize the LLMChain
+bedrock_chain = LLMChain(llm=llm, prompt=prompt)
+
 rekognition_client = boto3.client('rekognition')
-transcribe_client = boto3.client('transcribe')
 
 # Commands
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -31,13 +61,27 @@ def detect_text(image_bytes):
     return ' '.join(detected_text)
 
 # Responses
+# async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     text: str = update.message.text
+#     print(f"==> User: {text}")
+
+#     response: str = "Thank you for telling me more about your situation."
+#     print(f"==> Bot: {response}")
+#     await update.message.reply_text(response)
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text: str = update.message.text
     print(f"==> User: {text}")
 
-    response: str = "Thank you for telling me more about your situation."
-    print(f"==> Bot: {response}")
-    await update.message.reply_text(response)
+    language = "english"  # You can set this based on user preference
+    freeform_text = text
+
+    # Generate a response using Bedrock
+    response = bedrock_chain({'language': language, 'freeform_text': freeform_text})
+    generated_text = response['text']
+
+    print(f"==> Bot: {generated_text}")
+    await update.message.reply_text(generated_text)
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"==> User uploaded an image")
@@ -50,74 +94,6 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("No text detected.")
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print(f"==> User sent a voice message")
-    # download voice msg to device
-    file_id = update.message.voice.file_id
-    file = await context.bot.getFile(file_id)
-    await file.download_to_drive()
-    file_path = file.file_path.split(f'https://api.telegram.org/file/bot{bot_token}/voice/', 1)[1]
-    print("file path: ", file_path)
-
-    # upload voice msg to s3
-    s3_client.upload_file(file_path, 'voicemessagebucket', file_path)
-
-    # start transcription job
-    transcribe_client.start_transcription_job(
-        TranscriptionJobName=f'{file_path}_transcription_job',
-        LanguageCode='en-US',
-        Media={
-            'MediaFileUri': f's3://voicemessagebucket/{file_path}'
-        },
-        OutputBucketName='voicemessagetranscriptsbucket',
-        OutputKey=f'{file_path}_transcript'
-    )
-
-    # query for transcription job status
-    # possible transcription job statuses: QUEUED, IN_PROGRESS, FAILED, COMPLETED
-    transcribe_status = transcribe_client.get_transcription_job(
-        TranscriptionJobName=f'{file_path}_transcription_job'
-    )['TranscriptionJob']['TranscriptionJobStatus']
-
-    print("==> Transcribe Status: ", transcribe_status)
-    
-    while transcribe_status == 'IN_PROGRESS' or transcribe_status == 'QUEUED':
-        transcribe_status = transcribe_client.get_transcription_job(
-            TranscriptionJobName=f'{file_path}_transcription_job'
-        )['TranscriptionJob']['TranscriptionJobStatus']
-        print("==> Transcribe Status: ", transcribe_status)
-        time.sleep(2)
-    
-    if transcribe_status == 'FAILED':
-        await update.message.reply_text("Transcription of voice message failed.")
-    else:
-        print("==> Loading Transcript")
-        # retrieving completed transcript from s3
-        transcript_file = s3_client.get_object(
-            Bucket='voicemessagetranscriptsbucket', 
-            Key=f'{file_path}_transcript'
-            )
-
-        transcript_content = json.loads(transcript_file['Body'].read().decode('utf-8'))
-        transcript = transcript_content['results']['transcripts'][0]['transcript']
-        print("Transcript: ", transcript)
-        await update.message.reply_text(f'Transcript: {transcript}')
-    
-    print("==> Cleaning up after transcription job")
-    # removing voice message from device
-    os.remove(file_path)
-    # removing voice message from s3
-    s3_client.delete_object(
-        Bucket='voicemessagebucket', 
-        Key=f'{file_path}'
-    )
-    # removing transcript from s3
-    s3_client.delete_object(
-        Bucket='voicemessagetranscriptsbucket', 
-        Key=f'{file_path}_transcript'
-    )
-    print("==> Clean up completed")
-
 # Errors
 async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f'Update {update} caused error {context.error}')
@@ -125,6 +101,7 @@ async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == "__main__":
     print("=== igotscammed has been started ===")
+    print(f"Bot Token: {bot_token}")  # Add this line to check the token
     app = Application.builder().token(bot_token).build()
 
     # Commands
@@ -134,7 +111,6 @@ if __name__ == "__main__":
     # Responses
     app.add_handler(MessageHandler(filters.TEXT, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_image))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     # Errors
     app.add_error_handler(error)
