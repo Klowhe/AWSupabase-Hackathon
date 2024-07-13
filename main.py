@@ -7,6 +7,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from langchain_aws import ChatBedrock
 from langchain_core.prompts import ChatPromptTemplate
 
+from aws_clients.rekognition_client import detect_text
+from aws_clients.transcribe_client import transcribe_audio
+
 load_dotenv()
 bot_token = os.getenv('TELEGRAM_URL')
 
@@ -18,33 +21,22 @@ session = boto3.Session(
     region_name=os.getenv("AWS_DEFAULT_REGION")
 )
 
-#bedrock client
-bedrock_client = session.client(
-    service_name="bedrock-runtime",
-    region_name="us-west-2"
-)
+bedrock_client = session.client("bedrock-runtime")
 
+# Initialize ChatBedrock
 modelID = "anthropic.claude-v2:1"
-
-
 llm = ChatBedrock(
     model_id=modelID,
     client=bedrock_client,
     model_kwargs=dict(temperature=0.9)
 )
-
-# Define the prompt template
 prompt = ChatPromptTemplate.from_messages(
     [
         ("system", "You are a chatbot. You are in {language}."),
         ("human", "{input}")
     ]
 )
-
-# Initialize the LLMChain
 bedrock_chain = prompt | llm
-
-rekognition_client = session.client('rekognition')
 
 # Commands
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -54,41 +46,52 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("You have invoked the help command.")
 
 # Helpers
-def detect_text(image_bytes):
-    print("==> Detecting text from image with AWS Rekognition")
-    response = rekognition_client.detect_text(Image={'Bytes': image_bytes})
-
-    detected_text = []
-    # hacky method to fix duplicated detected text
-    halfway_point = (len(response['TextDetections']) // 2) - 1
-    for text_detection in response['TextDetections'][:halfway_point]:
-        detected_text.append(text_detection['DetectedText'])
-    return ' '.join(detected_text)
+def handle_message(text: str):
+    # You can set this based on user preference
+    language = "english"  
+    response = bedrock_chain.invoke({'language': language, 'input': text })
+    response_content = response.content
+    return response_content
 
 # Responses
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text: str = update.message.text
     print(f"==> User: {text}")
 
-    language = "english"  # You can set this based on user preference
-
-    # Generate a response using Bedrock
-    response = bedrock_chain.invoke({'language': language, 'input': text })
-    generated_text = response.content
-
-    print(f"==> Bot: {generated_text}")
-    await update.message.reply_text(generated_text)
+    reply: str = handle_message(text)
+    await update.message.reply_text(reply)
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"==> User uploaded an image")
+
+    # Download image file for Rekognition
     file = await context.bot.getFile(update.message.photo[-1].file_id)
     image_bytes = await file.download_as_bytearray()
-    
+
     detected_text = detect_text(image_bytes)
-    if detected_text:
-        await update.message.reply_text(f"Detected text:\n{detected_text}")
+    print(f"==> Detected text: {detected_text}")
+    if detected_text == '':
+        await update.message.reply_text("No relevant text is detected from the image. Please try again.")
     else:
-        await update.message.reply_text("No text detected.")
+        reply: str = handle_message(detected_text)
+        await update.message.reply_text(reply)
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"==> User sent a voice message")
+    
+    # Download voice message for S3
+    file_id = update.message.voice.file_id
+    file = await context.bot.getFile(file_id)
+    file_name = file.file_path.split(f'https://api.telegram.org/file/bot{bot_token}/voice/', 1)[1]
+    await file.download_to_drive(custom_path=f"temp/{file_name}")
+
+    transcript = transcribe_audio(file_name)
+    print(f"==> Transcript: {transcript}")
+    if transcript == '':
+        await update.message.reply_text("Transcription failed. Please try again.")
+    else:
+        reply: str = handle_message(transcript)
+        await update.message.reply_text(reply)
 
 # Errors
 async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -96,7 +99,7 @@ async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 if __name__ == "__main__":
-    print("=== igotscammed has been started ===")
+    print("=== telegram bot has been started ===")
     app = Application.builder().token(bot_token).build()
 
     # Commands
@@ -106,6 +109,7 @@ if __name__ == "__main__":
     # Responses
     app.add_handler(MessageHandler(filters.TEXT, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     # Errors
     app.add_error_handler(error)
