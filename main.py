@@ -11,6 +11,7 @@ from langchain.prompts import PromptTemplate
 load_dotenv()
 bot_token = os.getenv('TELEGRAM_URL')
 
+
 # Create a boto3 session with the new credentials
 session = boto3.Session(
     aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
@@ -27,11 +28,11 @@ bedrock_client = boto3.client(
 
 modelID = "anthropic.claude-v2:1"
 
-# Initialize Bedrock LLM
+
 llm = Bedrock(
     model_id=modelID,
     client=bedrock_client,
-    model_kwargs={"max_tokens_to_sample": 2000, "temperature": 0.9}
+    model_kwargs={"max_tokens_to_sample": 2000,"temperature":0.9}
 )
 
 # Define the prompt template
@@ -62,14 +63,6 @@ def detect_text(image_bytes):
     return ' '.join(detected_text)
 
 # Responses
-# async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     text: str = update.message.text
-#     print(f"==> User: {text}")
-
-#     response: str = "Thank you for telling me more about your situation."
-#     print(f"==> Bot: {response}")
-#     await update.message.reply_text(response)
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text: str = update.message.text
     print(f"==> User: {text}")
@@ -100,7 +93,7 @@ async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f'Update {update} caused error {context.error}')
 
 
-if __name__ == "__main__":
+if name == "main":
     print("=== igotscammed has been started ===")
     app = Application.builder().token(bot_token).build()
 
