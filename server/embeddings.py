@@ -3,81 +3,99 @@ import glob
 import concurrent.futures
 import traceback
 import logging
-from openai import OpenAI, RateLimitError
-from supabase import create_client, Client
-from postgrest import APIError
+import json
+import boto3
 from dotenv import load_dotenv
 import backoff
-from tiktoken import encoding_for_model
+import vecs
+from transformers import RobertaTokenizer
 
-# Load environment variables
+# Load environment variables from the parent directory
 load_dotenv()
-
 # Set up logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Set OpenAI API key
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Initialize vecs client
+try:
+    vx = vecs.Client(DB_CONNECTION)
+except Exception as e:
+    logging.error(f"Failed to initialize vecs client: {str(e)}")
+    exit(1)
 
-# Initialize Supabase client
-supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+# Check and handle dimension mismatch
+collection_name = "vectorized_sentences_12"
+desired_dimension = 1024
+
+try:
+    sentences = vx.get_collection(collection_name)
+    if sentences.dimension != desired_dimension:
+        logging.error(
+            f"Existing collection dimension ({sentences.dimension}) does not match desired dimension ({desired_dimension})"
+        )
+        exit(1)
+except vecs.exc.CollectionNotFound:
+    logging.info(f"Collection {collection_name} not found. Creating new collection.")
+    sentences = vx.get_or_create_collection(
+        name=collection_name, dimension=desired_dimension
+    )
+except Exception as e:
+    logging.error(f"Failed to get or create collection: {str(e)}")
+    exit(1)
+
+# Initialize Amazon Bedrock client
+try:
+    client = boto3.client(
+        "bedrock-runtime",
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        aws_session_token=AWS_SESSION_TOKEN,
+        region_name=AWS_DEFAULT_REGION,
+    )
+except Exception as e:
+    logging.error(f"Failed to initialize Bedrock client: {str(e)}")
+    exit(1)
 
 # Initialize the tokenizer
-tokenizer = encoding_for_model("text-embedding-ada-002")
+tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
 
 
-@backoff.on_exception(backoff.expo, RateLimitError, max_time=300)
-def generate_embeddings_openai(text):
+@backoff.on_exception(backoff.expo, Exception, max_tries=5)
+def generate_embeddings_bedrock(text):
     text = text.replace("\n", " ")
-    return (
-        openai_client.embeddings.create(input=[text], model="text-embedding-ada-002")
-        .data[0]
-        .embedding
+
+    response = client.invoke_model(
+        body=json.dumps({"inputText": text}),
+        modelId="amazon.titan-embed-text-v2:0",
+        accept="application/json",
+        contentType="application/json",
     )
 
-
-def ensure_table_exists(table_name="vectors"):
     try:
-        # Check if the table exists
-        supabase.table(table_name).select("id").limit(1).execute()
-    except APIError as e:
-        if e.code == "PGRST116":  # Table not found
-            # Create the table
-            supabase.postgrest.rpc("create_vectors_table").execute()
-            logging.info(f"Created table: {table_name}")
-        else:
-            raise
+        result = json.loads(response["body"].read())
+        embedding = result.get("embedding")
 
+        if embedding is None:
+            logging.error("No embedding found in the response.")
+            return None
 
-def upload_embeddings_to_supabase(points, table_name="vectors"):
-    ensure_table_exists(table_name)
+        if len(embedding) != 1024:
+            logging.warning(
+                f"Unexpected embedding dimension: {len(embedding)}. Expected 1024."
+            )
+            return None
 
-    try:
-        # Insert the points into Supabase
-        data = [
-            {"id": point["id"], "embedding": point["embedding"], "text": point["text"]}
-            for point in points
-        ]
-        result = supabase.table(table_name).insert(data).execute()
+        logging.info(f"Generated embedding with dimension: {len(embedding)}")
+        return embedding
 
-        if hasattr(result, "error") and result.error:
-            logging.error(f"Error uploading to Supabase: {result.error}")
-        else:
-            logging.info(f"Successfully uploaded {len(points)} points to Supabase")
     except Exception as e:
-        logging.error(f"Error uploading to Supabase: {str(e)}")
-        logging.error(f"Traceback: {traceback.format_exc()}")
+        logging.error(f"Failed to parse embedding from response: {str(e)}")
+        logging.error(f"Response content: {response['body'].read()}")
+        return None
 
 
-def chunk_text(text, max_tokens=512):
-    tokens = tokenizer.encode(text)
-    chunks = [tokens[i : i + max_tokens] for i in range(0, len(tokens), max_tokens)]
-    return [tokenizer.decode(chunk) for chunk in chunks]
-
-
-def process_file(filepath, table_name="vectors"):
+def process_file(filepath):
     try:
         logging.info(f"Processing file: {filepath}")
 
@@ -98,37 +116,28 @@ def process_file(filepath, table_name="vectors"):
             )
             return
 
-        text_chunks = chunk_text(sample_text)
-
-        points = []
-        for chunk in text_chunks:
+        for chunk in sample_text:
             try:
-                embeddings = generate_embeddings_openai(chunk)
-                if embeddings:
-                    point = {
-                        "id": int(hash(chunk) % 1e6),
-                        "embedding": embeddings,
-                        "text": chunk,
-                    }
-                    points.append(point)
+                embedding = generate_embeddings_bedrock(chunk)
+                if embedding is not None:
+                    sentences.upsert(
+                        records=[(sample_text, embedding, {})],
+                    )
+                else:
+                    logging.warning(
+                        f"Failed to generate valid embedding for chunk in {filepath}"
+                    )
             except Exception as e:
                 logging.error(
                     f"Error generating embedding for chunk in {filepath}: {str(e)}"
                 )
 
-        if points:
-            upload_embeddings_to_supabase(points, table_name)
-            logging.info(
-                f"Processed and uploaded {len(points)} chunks from: {filepath}"
-            )
-        else:
-            logging.warning(f"No valid points generated for: {filepath}")
     except Exception as e:
         logging.error(f"Error processing file {filepath}: {str(e)}")
         logging.error(f"Traceback: {traceback.format_exc()}")
 
 
-def process_files_in_folder(folder_path, table_name="vectors"):
+def process_files_in_folder(folder_path):
     filepaths = glob.glob(os.path.join(folder_path, "*.txt"))
 
     if not filepaths:
@@ -136,10 +145,7 @@ def process_files_in_folder(folder_path, table_name="vectors"):
         return
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [
-            executor.submit(process_file, filepath, table_name)
-            for filepath in filepaths
-        ]
+        futures = [executor.submit(process_file, filepath) for filepath in filepaths]
         for future in concurrent.futures.as_completed(futures):
             try:
                 future.result()
@@ -147,6 +153,7 @@ def process_files_in_folder(folder_path, table_name="vectors"):
                 logging.error(f"Error in thread: {str(e)}")
 
 
-# Set the folder path containing the .txt files
-folder_path = "./scraped_content"
-process_files_in_folder(folder_path)
+if __name__ == "__main__":
+    # Set the folder path containing the .txt files
+    folder_path = "./scraped_content"
+    process_files_in_folder(folder_path)
