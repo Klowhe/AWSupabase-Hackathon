@@ -57,8 +57,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def detect_text(image_bytes):
     print("==> Detecting text from image with AWS Rekognition")
     response = rekognition_client.detect_text(Image={'Bytes': image_bytes})
+
     detected_text = []
-    for text_detection in response['TextDetections']:
+    # hacky method to fix duplicated detected text
+    halfway_point = (len(response['TextDetections']) // 2) - 1
+    for text_detection in response['TextDetections'][:halfway_point]:
         detected_text.append(text_detection['DetectedText'])
     return ' '.join(detected_text)
 
