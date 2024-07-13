@@ -4,9 +4,8 @@ from typing import Final
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from langchain.chains import LLMChain
-from langchain.llms.bedrock import Bedrock
-from langchain.prompts import PromptTemplate
+from langchain_aws import ChatBedrock
+from langchain_core.prompts import ChatPromptTemplate
 
 load_dotenv()
 bot_token = os.getenv('TELEGRAM_URL')
@@ -20,7 +19,7 @@ session = boto3.Session(
 )
 
 #bedrock client
-bedrock_client = boto3.client(
+bedrock_client = session.client(
     service_name="bedrock-runtime",
     region_name="us-west-2"
 )
@@ -28,22 +27,24 @@ bedrock_client = boto3.client(
 modelID = "anthropic.claude-v2:1"
 
 
-llm = Bedrock(
+llm = ChatBedrock(
     model_id=modelID,
     client=bedrock_client,
-    model_kwargs={"max_tokens_to_sample": 2000,"temperature":0.9}
+    model_kwargs=dict(temperature=0.9)
 )
 
 # Define the prompt template
-prompt = PromptTemplate(
-    input_variables=["language", "freeform_text"],
-    template="You are a chatbot. You are in {language}.\n\n{freeform_text}"
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "You are a chatbot. You are in {language}."),
+        ("human", "{input}")
+    ]
 )
 
 # Initialize the LLMChain
-bedrock_chain = LLMChain(llm=llm, prompt=prompt)
+bedrock_chain = prompt | llm
 
-rekognition_client = boto3.client('rekognition')
+rekognition_client = session.client('rekognition')
 
 # Commands
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -67,11 +68,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"==> User: {text}")
 
     language = "english"  # You can set this based on user preference
-    freeform_text = text
 
     # Generate a response using Bedrock
-    response = bedrock_chain({'language': language, 'freeform_text': freeform_text})
-    generated_text = response['text']
+    response = bedrock_chain.invoke({'language': language, 'input': text })
+    generated_text = response.content
 
     print(f"==> Bot: {generated_text}")
     await update.message.reply_text(generated_text)
@@ -92,7 +92,7 @@ async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f'Update {update} caused error {context.error}')
 
 
-if __name__ == "main":
+if __name__ == "__main__":
     print("=== igotscammed has been started ===")
     app = Application.builder().token(bot_token).build()
 
