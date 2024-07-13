@@ -11,7 +11,6 @@ from langchain.prompts import PromptTemplate
 load_dotenv()
 bot_token = os.getenv('TELEGRAM_URL')
 
-
 # Create a boto3 session with the new credentials
 session = boto3.Session(
     aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
@@ -93,7 +92,7 @@ async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f'Update {update} caused error {context.error}')
 
 
-if name == "main":
+if __name__ == "main":
     print("=== igotscammed has been started ===")
     app = Application.builder().token(bot_token).build()
 
