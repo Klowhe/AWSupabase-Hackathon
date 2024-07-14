@@ -1,5 +1,7 @@
 import os
 import boto3
+import json
+import vecs
 import backoff
 from dotenv import load_dotenv
 from telegram import Update
@@ -30,6 +32,10 @@ url: str = os.environ.get("SUPABASE_URL")
 key: str = os.environ.get("SUPABASE_KEY")
 supabase_client: Client = create_client(url, key)
 
+# Create a vecs client
+vx = vecs.create_client(os.getenv("DB_CONNECTION"))
+sentences = vx.get_collection(name="sentences")
+
 # Initialize Bedrock model ID and other settings
 modelID = "anthropic.claude-v2:1"
 
@@ -51,7 +57,7 @@ prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You are an expert guide specializing in Singapore's property laws , focusing on buying, selling, stamp duties, renovation disputes, neighbor conflicts, and home ownership issues.",
+            "You are an expert guide specializing in Singapore's property laws , focusing on buying, selling, stamp duties, renovation disputes, neighbor conflicts, and home ownership issues. These are the relevant content that you can use to help answer the user's query: {context}. If necessary, ask the user clarifying questions to better understand his or her situation. Try to keep your replies succint as you are texting the user.",
         ),
         MessagesPlaceholder("history"),
         ("user", "{input}"),
@@ -80,14 +86,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Helpers
 @backoff.on_exception(backoff.expo, RateLimitError, max_time=300)
 async def generate_embeddings_openai(text):
-    text = text.replace("\n", " ")
-    response = openai_client.embeddings.create(
-        input=[text], model="text-embedding-ada-002"
+    response = bedrock_client.invoke_model(
+        body=json.dumps({"inputText": text}),
+        modelId="amazon.titan-embed-text-v2:0",
+        accept="application/json",
+        contentType="application/json",
     )
-    if response and response.data and len(response.data) > 0:
-        return response.data[0].embedding
-    return None
-
+    response_body = json.loads(response["body"].read())
+    query_embedding = response_body.get("embedding")
+    return query_embedding
 
 def store_message(user_id, message_id, role, content):
     (
@@ -104,7 +111,6 @@ def store_message(user_id, message_id, role, content):
         .execute()
     )
 
-
 def retrieve_chat_history(user_id):
     response = (
         supabase_client.table("chat_messages")
@@ -118,12 +124,17 @@ def retrieve_chat_history(user_id):
     chat_history = response.data
     return chat_history
 
-
-def handle_message(user_id: str, text: str):
-    chat_history = retrieve_chat_history(user_id)
-    response = bedrock_chain.invoke({"history": chat_history, "input": text})
-    response_content = response.content
-    return response_content
+async def handle_message(user_id: str, text: str):
+    embeddings = await generate_embeddings_openai(text)
+    if embeddings:
+        rag_results = sentences.query(data=embeddings, limit=3, include_value=True)
+        print("rag results: ", rag_results)
+        chat_history = retrieve_chat_history(user_id)
+        response = bedrock_chain.invoke({"history": chat_history, "input": text, "context": rag_results})
+        response_content = response.content
+        return response_content
+    else:
+        return "Error generating embeddings. Please try again later."
 
 
 # Responses
@@ -133,21 +144,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text: str = update.message.text
     print(f"==> User: {text}")
 
-    # Step 1: Generate embeddings for user input
-    embeddings = await generate_embeddings_openai(text)
-
-    if embeddings:
-        # print(f"==> Embeddings: {embeddings}")
-
-        # Step 2: Use embeddings for further processing (querying Bedrock)
-        reply: str = handle_message(user_id, text)
-        await update.message.reply_text(reply)
-        store_message(user_id, message_id, "user", text)
-        store_message(user_id, message_id, "assistant", reply)
-    else:
-        await update.message.reply_text(
-            "Error generating embeddings. Please try again later."
-        )
+    reply: str = await handle_message(user_id, text)
+    await update.message.reply_text(reply)
+    store_message(user_id, message_id, "user", text)
+    store_message(user_id, message_id, "assistant", reply)
 
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -166,7 +166,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "No relevant text is detected from the image. Please try again."
         )
     else:
-        reply: str = handle_message(user_id, detected_text)
+        reply: str = await handle_message(user_id, detected_text)
         await update.message.reply_text(reply)
         store_message(user_id, message_id, "user", detected_text)
         store_message(user_id, message_id, "assistant", reply)
@@ -190,7 +190,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if transcript == "":
         await update.message.reply_text("Transcription failed. Please try again.")
     else:
-        reply: str = handle_message(user_id, transcript)
+        reply: str = await handle_message(user_id, transcript)
         await update.message.reply_text(reply)
         store_message(user_id, message_id, "user", transcript)
         store_message(user_id, message_id, "assistant", reply)
