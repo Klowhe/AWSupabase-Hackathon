@@ -630,6 +630,7 @@ def handle_message(text: str):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text: str = update.message.text
     print(f"==> User: {text}")
+    print(f"==>hey")
 
     embeddings = get_text_embedding(text)
     if embeddings:
