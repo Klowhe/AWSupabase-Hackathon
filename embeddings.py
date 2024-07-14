@@ -1,94 +1,156 @@
+import os
+import glob
+import concurrent.futures
+import traceback
+import logging
 import json
+import boto3
+from dotenv import load_dotenv
+import backoff
 import vecs
-import boto3
-import os
-from dotenv import load_dotenv
-from langchain.chains import LLMChain
-from langchain_aws import ChatBedrock, BedrockLLM
-from langchain_core.prompts import ChatPromptTemplate
-import boto3
-import os
-from dotenv import load_dotenv
-from langchain_core.output_parsers.string import StrOutputParser
+from transformers import RobertaTokenizer
+import hashlib
+import numpy as np
 
+# Load environment variables from the parent directory
 load_dotenv()
 
-session = boto3.Session(
-    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-    aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
-    region_name=os.getenv("AWS_DEFAULT_REGION"),
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-modelID = "anthropic.claude-3-sonnet-20240229-v2:0"
-Bedrock_client = boto3.client("bedrock-runtime", "us-west-2")
+# Initialize vecs client
+try:
+    vx = vecs.Client(os.getenv("DB_CONNECTION"))
+except Exception as e:
+    logging.error(f"Failed to initialize vecs client: {str(e)}")
+    exit(1)
+
+# Get or create a collection named "sentences" with dimension 1024
+sentences = vx.get_or_create_collection(name="sentences", dimension=1024)
+
+# Initialize Amazon Bedrock client
+try:
+    client = boto3.client(
+        "bedrock-runtime",
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
+        region_name=os.getenv("AWS_DEFAULT_REGION"),
+    )
+except Exception as e:
+    logging.error(f"Failed to initialize Bedrock client: {str(e)}")
+    exit(1)
+
+# Initialize the tokenizer
+tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
 
 
-def add_context(sentence, db_name):
+@backoff.on_exception(backoff.expo, Exception, max_tries=5)
+def generate_embeddings_bedrock(text):
+    text = text.replace("\n", " ")
 
-    embeddings = []
-    # invoke the embeddings model for each sentence
-    response = Bedrock_client.invoke_model(
-        body=json.dumps({"inputText": sentence}),
-        modelId="amazon.titan-embed-text-v1",
+    response = client.invoke_model(
+        body=json.dumps({"inputText": text}),
+        modelId="amazon.titan-embed-text-v2:0",
         accept="application/json",
         contentType="application/json",
     )
-    # collect the embedding from the response
-    response_body = json.loads(response["body"].read())
-    # add the embedding to the embedding list
-    embeddings.append((sentence, response_body.get("embedding"), {}))
 
-    vx = vecs.Client(os.getenv("DB_CONNECTION"))
-    sentences = vx.get_or_create_collection(name=db_name, dimension=1536)
-    sentences.upsert(records=embeddings)
-    sentences.create_index()
+    try:
+        result = json.loads(response["body"].read())
+        embedding = result.get("embedding")
 
+        if embedding is None:
+            logging.error("No embedding found in the response.")
+            return None
 
-def rag_query(query_sentence, db_name, limiter):
+        if len(embedding) != 1024:
+            logging.warning(
+                f"Unexpected embedding dimension: {len(embedding)}. Expected 1024."
+            )
+            return None
 
-    # create vector store client
-    vx = vecs.Client(os.getenv("DB_CONNECTION"))
+        logging.info(f"Generated embedding with dimension: {len(embedding)}")
+        return embedding
 
-    # create an embedding for the query sentence
-    response = Bedrock_client.invoke_model(
-        body=json.dumps({"inputText": query_sentence}),
-        modelId="amazon.titan-embed-text-v1",
-        accept="application/json",
-        contentType="application/json",
-    )
-
-    response_body = json.loads(response["body"].read())
-
-    query_embedding = response_body.get("embedding")
-
-    sentences = vx.get_or_create_collection(name=db_name, dimension=1536)
-    # query the 'sentences' collection for the most similar sentences
-    results = sentences.query(data=query_embedding, limit=limiter, include_value=True)
-    # print the results
-    for result in results:
-        print(db_name, result)
-
-    return results
+    except Exception as e:
+        logging.error(f"Failed to parse embedding from response: {str(e)}")
+        logging.error(f"Response content: {response['body'].read()}")
+        return None
 
 
-def add_user_behaviour(sentence):
+def split_text_into_chunks(text, max_tokens=512):
+    tokens = tokenizer.tokenize(text)
+    chunks = []
+    for i in range(0, len(tokens), max_tokens):
+        chunk_tokens = tokens[i : i + max_tokens]
+        chunk_text = tokenizer.convert_tokens_to_string(chunk_tokens)
+        chunks.append(chunk_text)
+    return chunks
 
-    embeddings = []
 
-    # invoke the embeddings model for each sentence
-    response = Bedrock_client.invoke_model(
-        body=json.dumps({"inputText": sentence}),
-        modelId="amazon.titan-embed-text-v1",
-        accept="application/json",
-        contentType="application/json",
-    )
-    # collect the embedding from the response
-    response_body = json.loads(response["body"].read())
-    # add the embedding to the embedding list
-    embeddings.append((sentence, response_body.get("embedding"), {}))
+def process_file(filepath):
+    try:
+        logging.info(f"Processing file: {filepath}")
 
-    vx = vecs.Client(os.getenv("DB_CONNECTION"))
-    sentences = vx.get_or_create_collection(name="veggy", dimension=1536)
-    sentences.upsert(records=embeddings)
-    sentences.create_index()
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"File not found: {filepath}")
+
+        file_size = os.path.getsize(filepath)
+        if file_size == 0:
+            logging.warning(f"File is empty: {filepath}")
+            return
+
+        with open(filepath, "r", encoding="utf-8") as file:
+            sample_text = file.read()
+
+        if not sample_text.strip():
+            logging.warning(
+                f"File contains no text after stripping whitespace: {filepath}"
+            )
+            return
+
+        # Generate a unique identifier for the text
+        text_id = hashlib.md5(sample_text.encode()).hexdigest()
+
+        chunks = split_text_into_chunks(sample_text)
+        for i, chunk in enumerate(chunks):
+            embedding = generate_embeddings_bedrock(chunk)
+            if embedding is not None:
+                # Store the chunk content in the metadata
+                sentences.upsert(
+                    records=[
+                        (chunk, embedding, {"text_id": text_id, "chunk_index": i})
+                    ],
+                )
+                logging.info(f"Inserted embedding for chunk {i} of file {filepath}")
+            else:
+                logging.warning(
+                    f"Failed to generate valid embedding for chunk {i} of file {filepath}"
+                )
+
+    except Exception as e:
+        logging.error(f"Error processing file {filepath}: {str(e)}")
+        logging.error(f"Traceback: {traceback.format_exc()}")
+
+
+def process_files_in_folder(folder_path):
+    filepaths = glob.glob(os.path.join(folder_path, "*.txt"))
+
+    if not filepaths:
+        logging.warning(f"No .txt files found in the folder: {folder_path}")
+        return
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(process_file, filepath) for filepath in filepaths]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                logging.error(f"Error in thread: {str(e)}")
+
+
+directory = r"/home/chiatzeheng/Documents/projects/AWSupabase-Hackathon/scraped_content"
+process_files_in_folder(directory)
