@@ -75,13 +75,20 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session_id = message_id
     user_sessions[user_id] = session_id
 
-    reply = "Hey there, I am your friendly legal assistant."
+    reply = "Hey there! I am SG Legal Guru (Home Edition). Please free to ask me any questions via text, voice message or even image uploads!"
     await update.message.reply_text(reply)
 
+async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "SG Legal Guru (Home Edition) is your go-to source for navigating Singapore's property legalities, including buying and selling processes, stamp duties, resolving renovation and neighbor disputes, and managing home ownership issues. It provides accurate insights and guidance to help you understand and address these specific legal topics with confidence, based on information obtained from wwww.singaporelegaladvice.com."
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("You have invoked the help command.")
-
+    await update.message.reply_text(
+        "/about - Learn about SG Legal Guru (Home Edition)"
+        "/start - Start a session to describe your situation\n"
+        "/help - List of commands\n"
+    )
 
 # Helpers
 @backoff.on_exception(backoff.expo, RateLimitError, max_time=300)
@@ -207,6 +214,7 @@ if __name__ == "__main__":
 
     # Commands
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("about", about_command))
     app.add_handler(CommandHandler("help", help_command))
 
     # Responses
