@@ -12,7 +12,6 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from openai import OpenAI, RateLimitError
 from langchain_aws import ChatBedrock
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from supabase import create_client, Client
@@ -24,8 +23,6 @@ from aws_clients.transcribe_client import transcribe_audio
 load_dotenv()
 bot_token = os.getenv("TELEGRAM_URL")
 
-# Initialize OpenAI client
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Create a Supabase Client
 url: str = os.environ.get("SUPABASE_URL")
@@ -90,19 +87,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help - List of commands\n"
     )
 
-# Helpers
-@backoff.on_exception(backoff.expo, RateLimitError, max_time=300)
-async def generate_embeddings_openai(text):
-    response = bedrock_client.invoke_model(
-        body=json.dumps({"inputText": text}),
-        modelId="amazon.titan-embed-text-v2:0",
-        accept="application/json",
-        contentType="application/json",
-    )
-    response_body = json.loads(response["body"].read())
-    query_embedding = response_body.get("embedding")
-    return query_embedding
-
 def store_message(user_id, message_id, role, content):
     (
         supabase_client.table("chat_messages")
@@ -118,6 +102,7 @@ def store_message(user_id, message_id, role, content):
         .execute()
     )
 
+
 def retrieve_chat_history(user_id):
     response = (
         supabase_client.table("chat_messages")
@@ -131,13 +116,16 @@ def retrieve_chat_history(user_id):
     chat_history = response.data
     return chat_history
 
+
 async def handle_message(user_id: str, text: str):
     embeddings = await generate_embeddings_openai(text)
     if embeddings:
         rag_results = sentences.query(data=embeddings, limit=3, include_value=True)
         print("rag results: ", rag_results)
         chat_history = retrieve_chat_history(user_id)
-        response = bedrock_chain.invoke({"history": chat_history, "input": text, "context": rag_results})
+        response = bedrock_chain.invoke(
+            {"history": chat_history, "input": text, "context": rag_results}
+        )
         response_content = response.content
         return response_content
     else:
