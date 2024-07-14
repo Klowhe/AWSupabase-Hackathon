@@ -11,13 +11,18 @@ from supabase import create_client, Client
 
 from aws_clients.rekognition_client import detect_text
 from aws_clients.transcribe_client import transcribe_audio
+import json
+import vecs
 
 # Load environment variables
 load_dotenv()
 bot_token = os.getenv('TELEGRAM_URL')
 
-# Initialize OpenAI client
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+DB_CONNECTION = os.getenv("DATABASE_URL")
+# create vector store client
+vx = vecs.Client(DB_CONNECTION)
+# to match the default dimension of the Titan Embeddings G1 - Text model
+vectordb = vx.get_or_create_collection(name="vectordb", dimension=1536)
 
 # Create a Supabase Client
 url: str = os.environ.get("SUPABASE_URL")
@@ -67,14 +72,60 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("You have invoked the help command.")
 
-# Helpers
-@backoff.on_exception(backoff.expo, RateLimitError, max_time=300)
-async def generate_embeddings_openai(text):
-    text = text.replace("\n", " ")
-    response = openai_client.embeddings.create(input=[text], model="text-embedding-ada-002")
-    if response and response.data and len(response.data) > 0:
-        return response.data[0].embedding
-    return None
+def get_text_embedding(text: str):
+    try:
+        response = bedrock_client.invoke_model(
+            body=json.dumps({"inputText": text}),
+            modelId="amazon.titan-embed-text-v1",
+            accept="application/json",
+            contentType="application/json"
+        )
+        response_body = json.loads(response["body"].read())
+        embeddings = response_body.get("embedding")
+        return embeddings
+    except Exception as e:
+        print(f"Error generating text embeddings: {e}")
+        return None
+
+def get_image_embedding(image_bytes: bytes):
+    try:
+        response = bedrock_client.invoke_model(
+            body=json.dumps({"inputImage": image_bytes.decode('latin-1')}),  # Convert bytes to base64 string
+            modelId="amazon.titan-embed-image-v1",
+            accept="application/json",
+            contentType="application/json"
+        )
+        response_body = json.loads(response["body"].read())
+        embeddings = response_body.get("embedding")
+        return embeddings
+    except Exception as e:
+        print(f"Error generating image embeddings: {e}")
+        return None
+
+async def query_supabase_for_relevant_content(embedding):
+    query = """
+    SELECT * FROM vectordb
+    ORDER BY similarity(embedding, %s) DESC
+    LIMIT 5
+    """
+    results = await vx.query(query, (embedding,))
+    return results
+
+def get_claude_response(question: str, context: str):
+    prompt = f"Context: {context}\nQuestion: {question}"
+    try:
+        response = bedrock_client.invoke_model(
+            body=json.dumps({"content": prompt}),
+            modelId="anthropic.claude-v2:1",
+            accept="application/json",
+            contentType="application/json"
+        )
+        response_body = json.loads(response["body"].read())
+        answer = response_body.get("content")
+        return answer
+    except Exception as e:
+        print(f"Error generating Claude response: {e}")
+        return "An error occurred while generating the response."
 
 def store_message(user_id, message_id, role, content):
     (supabase_client.table("chat_messages")
@@ -108,21 +159,19 @@ def handle_message(user_id: str, text: str):
     response_content = response.content
     return response_content
 
-# Responses
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     message_id = update.message.message_id
     text: str = update.message.text
     print(f"==> User: {text}")
+    print(f"==>hey")
 
-    # Step 1: Generate embeddings for user input
-    embeddings = await generate_embeddings_openai(text)
-
+    embeddings = get_text_embedding(text)
     if embeddings:
-        # print(f"==> Embeddings: {embeddings}")
-
-        # Step 2: Use embeddings for further processing (querying Bedrock)
-        reply: str = handle_message(user_id, text)
+        print(f"==> Embeddings: {embeddings}")
+        relevant_content = await query_supabase_for_relevant_content(embeddings)
+        context_text = " ".join(item['text'] for item in relevant_content)  # Adjust as needed
+        reply = get_claude_response(text, context_text)
         await update.message.reply_text(reply)
         store_message(user_id, message_id, "user", text)
         store_message(user_id, message_id, "assistant", reply)
@@ -134,10 +183,14 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_id = update.message.message_id
     print(f"==> User uploaded an image")
 
-    # Download image file for Rekognition
     file = await context.bot.getFile(update.message.photo[-1].file_id)
     image_bytes = await file.download_as_bytearray()
 
+    embeddings = get_image_embedding(image_bytes)
+    if embeddings:
+        relevant_content = await query_supabase_for_relevant_content(embeddings)
+        context_text = " ".join(item['text'] for item in relevant_content)  # Adjust as needed
+        reply = get_claude_response("Provide a summary of the image content.", context_text)
     detected_text = detect_text(image_bytes)
     print(f"==> Detected text: {detected_text}")
     if detected_text == '':
@@ -145,6 +198,8 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         reply: str = handle_message(user_id, detected_text)
         await update.message.reply_text(reply)
+    else:
+        await update.message.reply_text("Error generating embeddings. Please try again later.")
 
         store_message(user_id, message_id, "user", detected_text)
         store_message(user_id, message_id, "assistant", reply)
